@@ -1,0 +1,6 @@
+# ignore __pycache__ directories
+__pycache__/
+
+# ignore files starting with "_" (except for __init__.py)
+_*
+!__init__.py

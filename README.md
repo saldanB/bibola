@@ -1,0 +1,1 @@
+# Batch Integration Based On Local Autocorrelation
