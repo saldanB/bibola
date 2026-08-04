@@ -88,7 +88,7 @@ class MultiBatchesMLP(torch.nn.Module):
             all_indices = torch.cat(batch_indices, dim=0)
             outputs = outputs.scatter(0, all_indices.unsqueeze(1).expand_as(all_outputs), all_outputs)
         return outputs
-    
+        
     
     def loss(self, x, w, a_inter, batch, a_intra=None, norm=2):
         
@@ -105,8 +105,12 @@ class MultiBatchesMLP(torch.nn.Module):
         
         knn_similarity = w_transformed[a_inter>0]
         
-        return abs_lisa_values.mean() + (-topology_preservation_scores).mean() + (-knn_similarity).mean()
-    
+        return {
+            "abs_lisa_loss": abs_lisa_values.mean(),
+            "topology_loss": (-topology_preservation_scores).mean(),
+            "knn_loss": (-knn_similarity).mean()
+        }
+
     def fit(self, x, batch, epochs, norm=2, lr=1e-3, print_every=10, k_inter=5, k_intra=None):
         self.train()
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
@@ -123,7 +127,8 @@ class MultiBatchesMLP(torch.nn.Module):
         with torch.autograd.set_detect_anomaly(True):
             for epoch in range(epochs):
                 optimizer.zero_grad()
-                loss = self.loss(x, w, a_inter, batch, a_intra=a_intra, norm=norm)
+                loss_dict = self.loss(x, w, a_inter, batch, a_intra=a_intra, norm=norm)
+                loss = sum(loss_dict.values())
                 loss.backward()
                 optimizer.step()
                 if epoch % print_every == 0:
