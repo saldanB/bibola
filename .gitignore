@@ -4,3 +4,6 @@ __pycache__/
 # ignore files starting with "_" (except for __init__.py)
 _*
 !__init__.py
+
+# ignore ./data content
+data/*
