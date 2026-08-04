@@ -111,7 +111,7 @@ class MultiBatchesMLP(torch.nn.Module):
             "knn_loss": (-knn_similarity).mean()
         }
 
-    def fit(self, x, batch, epochs, norm=2, lr=1e-3, print_every=10, k_inter=5, k_intra=None):
+    def fit(self, x, batch, epochs, norm=2, lr=1e-3, print_every=10, k_inter=5, k_intra=None, loss_weights=None):
         self.train()
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         
@@ -124,11 +124,18 @@ class MultiBatchesMLP(torch.nn.Module):
         # adjacency matrix of the intra-batch graph, where edges connect samples from the same batch based on their similarity.
         a_intra = intra_batch_graph(x, batch, k=k_intra) if k_intra is not None else None
         
+        if loss_weights is None:
+            loss_weights = {
+                "abs_lisa_loss": 1.0,
+                "topology_loss": 1.0,
+                "knn_loss": 1.0
+            }
+        
         with torch.autograd.set_detect_anomaly(True):
             for epoch in range(epochs):
                 optimizer.zero_grad()
                 loss_dict = self.loss(x, w, a_inter, batch, a_intra=a_intra, norm=norm)
-                loss = sum(loss_dict.values())
+                loss = sum(loss_dict[loss_name] * weight for loss_name, weight in loss_weights.items())
                 loss.backward()
                 optimizer.step()
                 if epoch % print_every == 0:
