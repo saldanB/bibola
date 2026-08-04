@@ -55,6 +55,8 @@ def batch_similarity_preservation(W: torch.Tensor, W_transformed: torch.Tensor, 
     for b in n_batches:
         if adj is not None:
             batch_adj = adj[batch == b][:, batch == b]
+        else:
+            batch_adj = None
         # Get indices of the current batch
         indices = (batch == b).nonzero(as_tuple=True)[0]
         
