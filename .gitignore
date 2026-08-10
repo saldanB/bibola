@@ -7,3 +7,7 @@ _*
 
 # ignore ./data content
 data/*
+
+# ignore all private files and folders (starting with ".") except for .gitignore
+.*
+!.gitignore

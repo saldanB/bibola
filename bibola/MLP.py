@@ -61,13 +61,16 @@ class MultiBatchesMLP(torch.nn.Module):
             for _ in range(n_batches)
         ])
         
+        self.initialize_weights()  # Initialize weights for all MLPs
+    
+    
+    def initialize_weights(self):     
         # Apply Kaiming Normal initialization to the FIRST MLP
         for module in self.mlps[0].modules():
             if isinstance(module, torch.nn.Linear):
                 torch.nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
                 if module.bias is not None:
                     torch.nn.init.constant_(module.bias, 0)
-
         # Clone the exact state of the first MLP into all other MLPs
         base_state_dict = self.mlps[0].state_dict()
         for i in range(1, self.n_batches):
@@ -140,9 +143,6 @@ class MultiBatchesMLP(torch.nn.Module):
                 optimizer.step()
                 if epoch % print_every == 0:
                     print(f"Epoch {epoch}, Loss: {loss.item()}")
-                  
-        
-        
-        
-        
-        
+
+
+
