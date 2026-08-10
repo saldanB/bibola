@@ -49,9 +49,6 @@ def LIBSA(W: torch.Tensor, batch: torch.Tensor, norm: int = 2) -> torch.Tensor:
         batch (torch.Tensor): A tensor of shape (n_samples,) representing the batch indices.
         norm (int): The order of the norm (default is 2 for Euclidean distance).
 
-        batch (torch.Tensor): A tensor of shape (n_samples,) representing the batch indices.
-        norm (int): The order of the norm (default is 2 for Euclidean distance).
-
     Returns:
         torch.Tensor: A tensor of shape (n_samples, n_batches) representing the computed LISA values for each sample and batch.
     """
@@ -69,7 +66,7 @@ def LIBSA(W: torch.Tensor, batch: torch.Tensor, norm: int = 2) -> torch.Tensor:
     W = W / W.sum(dim=1, keepdim=True)  # Row-normalize the spatial weights matrix
     
     columns = []
-    for b in range(batch.max() + 1):
+    for b in range(n_batches):
         y = (batch == b).float()
         y_mean = y.mean()
         y_std = y.std(unbiased=False)

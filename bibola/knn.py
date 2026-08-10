@@ -104,8 +104,10 @@ def intra_batch_graph(X: torch.Tensor, batch: torch.Tensor, k: int = 5) -> torch
         if effective_k <= 0:
             continue  # Skip if not enough samples in the batch
         
-        # Find k-nearest neighbors within the batch
-        sub_knn_idx = torch.topk(sub_dist + torch.eye(len(idx), device=X.device) * float('inf'), 
+        # Find k-nearest neighbors within the batch (mask self so it's never picked;
+        # eye * inf would give NaN off-diagonal since 0 * inf = NaN, corrupting topk)
+        self_mask = torch.eye(len(idx), dtype=torch.bool, device=X.device)
+        sub_knn_idx = torch.topk(sub_dist.masked_fill(self_mask, float('inf')),
                                   k=effective_k, largest=False, dim=1).indices
         
         # Map local sub-matrix indices back to global N x N indices

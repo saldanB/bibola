@@ -11,3 +11,6 @@ data/*
 # ignore all private files and folders (starting with ".") except for .gitignore
 .*
 !.gitignore
+
+# ignore tests
+tests/
