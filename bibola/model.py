@@ -131,6 +131,8 @@ class BaseIntegration():
                 [param for model in self.models.values() for param in model.parameters()],
                 **self.optimizer_kwargs
             )
+            
+            self._loss_cache = []  # reset the loss cache when reinitializing models
 
         # reset the per-effect similarity/adjacency cache: run_epoch fills this in lazily
         # on its first call and reuses it across epochs since X and batch_ids are constant
@@ -309,10 +311,66 @@ class BaseIntegration():
         loss_dict = self.loss(X, batch_ids, norm=norm)
         total_loss = sum(loss_dict[loss_name] * weight for loss_name, weight in loss_weights.items())
         total_loss /= sum(loss_weights.values()) # normalize by the sum of weights so that the absolute scale of the weights doesn't matter
-
+        
+        self._loss_cache.append({})  # store the loss components for this epoch
+        self._loss_cache[-1]["loss"] = {loss_name: loss_value.item()for loss_name, loss_value in loss_dict.items()}
+        self._loss_cache[-1]["loss_weights"] = loss_weights
+        
         total_loss.backward()
         self.optimizer.step()
-
+        
         return total_loss.item()
     
+    @property
+    def loss_history(self):
+        return pd.DataFrame.from_dict({
+            (outer, inner): [row[outer][inner] for row in self._loss_cache]
+            for outer in self._loss_cache[0]
+            for inner in self._loss_cache[0][outer]
+        }, orient="columns")
     
+    
+class ChunkIntegration(BaseIntegration):
+    """
+    A subclass of BaseIntegration that performs chunked training.
+    Particularly useful for large datasets whose adjacencys and similarity matrices do not fit in memory.
+    The n_chunks parameter controls the number of chunks used for training.
+    """
+    
+    def __init__(self, in_channels: int, hidden_channels: list, out_channels: int,
+                 optimizer_type: torch.optim.Optimizer = None, optimizer_kwargs: dict = None,
+                 **kwargs):
+        super().__init__(in_channels, hidden_channels, out_channels,
+                         optimizer_type=optimizer_type, optimizer_kwargs=optimizer_kwargs,
+                         **kwargs)
+        
+    def run_epoch(self, X, batch_ids, loss_weights: dict, norm: int = 2,
+                  k_inter: int = 5, k_intra: int = None, n_chunks: int = 10,
+                  random_seed : int = None, **kwargs):
+        """
+        Run a single training epoch with chunked processing.
+
+        Args:
+            X (array like): Input data of shape (n_samples, n_features).
+            batch_ids (torch.Tensor): Batch IDs of shape (n_samples, n_effects).
+            loss_weights (dict): Weights for different loss components.
+            norm (int): The norm to use for the loss calculation.
+            k_inter (int, optional): Number of inter-batch neighbors to use (for knn loss).
+            k_intra (int, optional): Number of intra-batch neighbors to use (for topology loss).
+            n_chunks (int): Number of chunks to split the data into for processing.
+            random_seed (int, optional): Random seed for reproducibility.
+            **kwargs: Additional keyword arguments for training.
+        """
+        
+        self.set_mode('train')
+        self.optimizer.zero_grad()
+        
+        # Split the data into chunks
+        chunk_size = X.size(0) // n_chunks
+        
+        # stratify X and batch_ids into n_chunks according to the given seed
+        # each chunch should be omogeneous in terms of batch_ids for each effect.
+        
+        raise NotImplementedError("Chunked training is not yet implemented. Please use the BaseIntegration class for now.")
+        
+        

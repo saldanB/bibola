@@ -15,7 +15,6 @@ class BatchMLP(torch.nn.Module):
             in_channels (int): Number of input channels.
             hidden_channels (list): List of hidden channel sizes.
             out_channels (int): Number of output channels.
-            **kwargs: Additional keyword arguments for the MLP.
         """
         super(BatchMLP, self).__init__()
         self.sequential = torch.nn.Sequential(
