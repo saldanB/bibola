@@ -112,7 +112,7 @@ class BaseIntegration():
                 self.batch_dict[effect] = {key: i for i, key in enumerate(unique_keys)}
                 batch_ids[effect] = batch_metadata[effect].map(self.batch_dict[effect])
         batch_ids = torch.tensor(batch_ids.values, dtype=torch.int32)
-        
+
         if reinitialize or not hasattr(self, "models"):
             # create a MultiBatchesMLP model for each effect
             self.models = {
@@ -140,11 +140,16 @@ class BaseIntegration():
         # cache left over from a previous run.
         self._epoch_cache = None
 
-        return batch_ids
+        return X, batch_ids
     
     
+    @staticmethod
+    def _format_loss(loss_dict) -> str:
+        return ", ".join(f"{loss_name}={loss_value:.4f}" for loss_name, loss_value in loss_dict.items())
+
     def fit(self, X, batch_metadata, epochs: int, k_inter: int = 5, k_intra: int = None,
-            loss_weights: dict = None, norm: int = 2, reinitialize: bool = False, **kwargs):
+            loss_weights: dict = None, norm: int = 2, reinitialize: bool = False,
+            print_every: int = None, **kwargs):
         """
         Fit the BaseIntegration model.
 
@@ -157,23 +162,28 @@ class BaseIntegration():
             loss_weights (dict, optional): Weights for different loss components.
             norm (int): The norm to use for the loss calculation.
             reinitialize (bool): Whether to reinitialize the model parameters before training.
+            print_every (int, optional): Print the epoch loss every print_every epochs.
+                None (default) disables printing.
         """
-        
-        batch_ids = self.training_setup(X, batch_metadata, reinitialize=reinitialize)
-        
+
+        X, batch_ids = self.training_setup(X, batch_metadata, reinitialize=reinitialize)
+
         if loss_weights is None:
             loss_weights = {
                 "abs_lisa_loss": 1.0,
                 "topology_loss": 1.0,
                 "knn_loss": 1.0
             }
-        
+
         for epoch in range(epochs):
-            self.run_epoch(
+            total_loss = self.run_epoch(
                 X, batch_ids, loss_weights=loss_weights, norm=norm,
                 k_inter=k_inter, k_intra=k_intra, **kwargs
             )
-        
+            if print_every is not None and (epoch % print_every == 0 or epoch == epochs - 1):
+                components = self._format_loss(self._loss_cache[-1]["loss"])
+                print(f"Epoch {epoch + 1}/{epochs} - total_loss={total_loss:.4f} ({components})")
+
         return
     
     def forward(self, X, batch_ids):
@@ -276,7 +286,7 @@ class BaseIntegration():
         }
 
     def run_epoch(self, X, batch_ids, loss_weights: dict, norm: int = 2,
-                  k_inter: int = 5, k_intra: int = None, **kwargs):
+                  k_inter: int = 5, k_intra: int = None, verbose: bool = False, **kwargs):
         """
         Run a single training epoch.
 
@@ -287,6 +297,7 @@ class BaseIntegration():
             norm (int): The norm to use for the loss calculation.
             k_inter (int, optional): Number of inter-batch neighbors to use (for knn loss).
             k_intra (int, optional): Number of intra-batch neighbors to use (for topology loss).
+            verbose (bool): Whether to print the loss breakdown for this epoch.
             **kwargs: Additional keyword arguments for training.
         """
         
@@ -315,10 +326,13 @@ class BaseIntegration():
         self._loss_cache.append({})  # store the loss components for this epoch
         self._loss_cache[-1]["loss"] = {loss_name: loss_value.item()for loss_name, loss_value in loss_dict.items()}
         self._loss_cache[-1]["loss_weights"] = loss_weights
-        
+
+        if verbose:
+            print(f"  loss: {self._format_loss(self._loss_cache[-1]['loss'])}")
+
         total_loss.backward()
         self.optimizer.step()
-        
+
         return total_loss.item()
     
     @property
@@ -344,11 +358,60 @@ class ChunkIntegration(BaseIntegration):
                          optimizer_type=optimizer_type, optimizer_kwargs=optimizer_kwargs,
                          **kwargs)
         
+    def _stratified_chunks(self, batch_ids, n_chunks: int, random_seed: int = None):
+        """
+        Partition sample indices into n_chunks groups, each homogeneous in batch_ids
+        composition for every effect (stratified split).
+
+        Samples are grouped by their joint (per-effect) batch label combination, each
+        group is shuffled, and its members are dealt round-robin across the n_chunks
+        buckets, so every chunk gets close to the same proportion of every batch id,
+        for every effect, as the full dataset.
+
+        Args:
+            batch_ids (torch.Tensor): Batch IDs of shape (n_samples, n_effects).
+            n_chunks (int): Number of chunks to produce.
+            random_seed (int, optional): Seed for the shuffle within each stratum.
+
+        Returns:
+            list[torch.Tensor]: n_chunks tensors of sample indices.
+        """
+        generator = torch.Generator()
+        if random_seed is not None:
+            # offset by a call counter so repeated epochs (same seed passed every
+            # time by fit()) don't re-draw the exact same chunks, while staying
+            # reproducible run-to-run.
+            self._chunk_call_count = getattr(self, "_chunk_call_count", 0) + 1
+            generator.manual_seed(random_seed + self._chunk_call_count)
+        else:
+            generator.seed()
+
+        composite_key = torch.zeros(batch_ids.size(0), dtype=torch.int64)
+        for effect in self.effects:
+            n_batches_effect = len(self.batch_dict[effect])
+            composite_key = composite_key * n_batches_effect + batch_ids[:, self.effects.index(effect)].to(torch.int64)
+
+        chunks = [[] for _ in range(n_chunks)]
+        for key in composite_key.unique():
+            group_indices = (composite_key == key).nonzero(as_tuple=True)[0]
+            shuffled = group_indices[torch.randperm(group_indices.size(0), generator=generator)]
+            for i, idx in enumerate(shuffled.tolist()):
+                chunks[i % n_chunks].append(idx)
+
+        return [torch.tensor(chunk, dtype=torch.long) for chunk in chunks]
+
     def run_epoch(self, X, batch_ids, loss_weights: dict, norm: int = 2,
                   k_inter: int = 5, k_intra: int = None, n_chunks: int = 10,
-                  random_seed : int = None, **kwargs):
+                  random_seed : int = None, verbose: bool = False, **kwargs):
         """
         Run a single training epoch with chunked processing.
+
+        Chunks are re-drawn (stratified by batch_ids) on every call, since a fresh
+        partition is what makes chunked training approximate full-batch training over
+        many epochs. Each chunk gets its own similarity matrix and adjacency graphs
+        (too expensive to keep N x N tensors for every chunk of every epoch around),
+        and its own backward()/step() call, so one epoch performs n_chunks optimizer
+        updates instead of one.
 
         Args:
             X (array like): Input data of shape (n_samples, n_features).
@@ -359,18 +422,51 @@ class ChunkIntegration(BaseIntegration):
             k_intra (int, optional): Number of intra-batch neighbors to use (for topology loss).
             n_chunks (int): Number of chunks to split the data into for processing.
             random_seed (int, optional): Random seed for reproducibility.
+            verbose (bool): Whether to print the loss breakdown for each chunk.
             **kwargs: Additional keyword arguments for training.
         """
-        
+
         self.set_mode('train')
-        self.optimizer.zero_grad()
-        
-        # Split the data into chunks
-        chunk_size = X.size(0) // n_chunks
-        
-        # stratify X and batch_ids into n_chunks according to the given seed
-        # each chunch should be omogeneous in terms of batch_ids for each effect.
-        
-        raise NotImplementedError("Chunked training is not yet implemented. Please use the BaseIntegration class for now.")
-        
-        
+
+        chunk_indices = self._stratified_chunks(batch_ids, n_chunks, random_seed=random_seed)
+
+        chunk_losses = {}
+        chunk_total_losses = []
+        for i, indices in enumerate(chunk_indices):
+            if indices.numel() == 0:
+                continue
+
+            X_chunk = X[indices]
+            batch_ids_chunk = batch_ids[indices]
+
+            # per-chunk similarity/adjacency: chunk membership changes every epoch, so
+            # nothing here is worth caching across calls the way BaseIntegration does.
+            a_inter_chunk, a_intra_chunk = {}, {}
+            for effect in self.effects:
+                batch_col = batch_ids_chunk[:, self.effects.index(effect)]
+                a_inter_chunk[effect] = inter_batch_graph(X_chunk, batch_col, k=k_inter)
+                a_intra_chunk[effect] = intra_batch_graph(X_chunk, batch_col, k=k_intra) if k_intra is not None else None
+            self._epoch_cache = {"w": similarity_matrix(X_chunk, norm=norm), "a_inter": a_inter_chunk, "a_intra": a_intra_chunk}
+
+            self.optimizer.zero_grad()
+            loss_dict = self.loss(X_chunk, batch_ids_chunk, norm=norm)
+            total_loss = sum(loss_dict[loss_name] * weight for loss_name, weight in loss_weights.items())
+            total_loss /= sum(loss_weights.values())
+            total_loss.backward()
+            self.optimizer.step()
+
+            for loss_name, loss_value in loss_dict.items():
+                chunk_losses.setdefault(loss_name, []).append(loss_value.item())
+            chunk_total_losses.append(total_loss.item())
+
+            if verbose:
+                components = self._format_loss({name: value.item() for name, value in loss_dict.items()})
+                print(f"  chunk {i + 1}/{n_chunks} - total_loss={total_loss.item():.4f} ({components})")
+
+        self._epoch_cache = None  # nothing carries over: next epoch draws a fresh partition
+
+        self._loss_cache.append({})
+        self._loss_cache[-1]["loss"] = {loss_name: sum(values) / len(values) for loss_name, values in chunk_losses.items()}
+        self._loss_cache[-1]["loss_weights"] = loss_weights
+
+        return sum(chunk_total_losses) / len(chunk_total_losses)
