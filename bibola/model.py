@@ -28,10 +28,54 @@ class BaseIntegration():
         self.out_channels = out_channels
         self.optimizer_type = optimizer_type if optimizer_type is not None else torch.optim.Adam
         self.optimizer_kwargs = optimizer_kwargs if optimizer_kwargs is not None else {}
-        self.model_kwargs = kwargs        
+        self.model_kwargs = kwargs
+
+
+    def __repr__(self):
+        status = f"fitted, effects={self.effects}" if hasattr(self, "effects") else "not fitted"
+        return (f"{self.__class__.__name__}(in_channels={self.in_channels}, "
+                f"hidden_channels={self.hidden_channels}, out_channels={self.out_channels}, "
+                f"optimizer={self.optimizer_type.__name__}, {status})")
+
+
+    def __str__(self):
+        lines = [f"{self.__class__.__name__}"]
+        lines.append(f"  in_channels:     {self.in_channels}")
+        lines.append(f"  hidden_channels: {self.hidden_channels}")
+        lines.append(f"  out_channels:    {self.out_channels}")
+        lines.append(f"  optimizer:       {self.optimizer_type.__name__}({self.optimizer_kwargs})")
+        if self.model_kwargs:
+            lines.append(f"  model_kwargs:    {self.model_kwargs}")
+
+        if hasattr(self, "effects"):
+            n_params = sum(p.numel() for model in self.models.values() for p in model.parameters())
+            lines.append(f"  status:          fitted ({n_params:,} parameters)")
+            lines.append("  effects:")
+            for effect in self.effects:
+                lines.append(f"    - {effect}: {len(self.batch_dict[effect])} batches")
+        else:
+            lines.append("  status:          not fitted (call fit() or training_setup())")
+
+        return "\n".join(lines)
+
+
+    def set_mode(self, mode: str):
+        """
+        Set the mode of the model.
+
+        Args:
+            mode (str): Mode to set ('train' or 'eval').
+        """
+        for model in self.models.values():
+            if mode == 'train':
+                model.train()
+            elif mode == 'eval':
+                model.eval()
+            else:
+                raise ValueError(f"Unknown mode '{mode}'. Use 'train' or 'eval'.")
     
     
-    def training_setup(self, X, batch_metadata):
+    def training_setup(self, X, batch_metadata, reinitialize: bool = False):
         """
         prepare the training setup for the BaseIntegration.
 
@@ -39,6 +83,9 @@ class BaseIntegration():
             X (array like): Input data of shape (n_samples, n_features).
             batch_metadata (array like): Batch labels of shape (n_samples,) or (n_samples, n_effects).
             epochs (int): Number of training epochs.
+            reinitialize (bool): Whether to rebuild (fresh-initialize) the per-effect models and
+                the optimizer. Skipped when models already exist and reinitialize is False, so a
+                second fit() call on the same instance continues training the existing weights.
             **kwargs: Additional keyword arguments for training.
         """
         
@@ -66,23 +113,24 @@ class BaseIntegration():
                 batch_ids[effect] = batch_metadata[effect].map(self.batch_dict[effect])
         batch_ids = torch.tensor(batch_ids.values, dtype=torch.int32)
         
-        # create a MultiBatchesMLP model for each effect
-        self.models = {
-            effect: MultiBatchesMLP(
-                in_channels=self.in_channels,
-                hidden_channels=self.hidden_channels,
-                out_channels=self.out_channels,
-                n_batches=len(self.batch_dict[effect]), # number of unique ids for this effect
-                **self.model_kwargs
+        if reinitialize or not hasattr(self, "models"):
+            # create a MultiBatchesMLP model for each effect
+            self.models = {
+                effect: MultiBatchesMLP(
+                    in_channels=self.in_channels,
+                    hidden_channels=self.hidden_channels,
+                    out_channels=self.out_channels,
+                    n_batches=len(self.batch_dict[effect]), # number of unique ids for this effect
+                    **self.model_kwargs
+                )
+                for effect in self.effects
+            }
+
+            # initialize the optimizer in order to manage parameters from all models
+            self.optimizer = self.optimizer_type(
+                [param for model in self.models.values() for param in model.parameters()],
+                **self.optimizer_kwargs
             )
-            for effect in self.effects
-        }
-        
-        # initialize the optimizer in order to manage parameters from all models
-        self.optimizer = self.optimizer_type(
-            [param for model in self.models.values() for param in model.parameters()],
-            **self.optimizer_kwargs
-        )
 
         # reset the per-effect similarity/adjacency cache: run_epoch fills this in lazily
         # on its first call and reuses it across epochs since X and batch_ids are constant
@@ -93,7 +141,8 @@ class BaseIntegration():
         return batch_ids
     
     
-    def fit(self, X, batch_metadata, epochs: int, k_inter: int = 5, k_intra: int = None, loss_weights: dict = None, norm: int = 2, **kwargs):
+    def fit(self, X, batch_metadata, epochs: int, k_inter: int = 5, k_intra: int = None,
+            loss_weights: dict = None, norm: int = 2, reinitialize: bool = False, **kwargs):
         """
         Fit the BaseIntegration model.
 
@@ -105,9 +154,10 @@ class BaseIntegration():
             k_intra (int, optional): Number of intra-batch neighbors to use (for topology loss).
             loss_weights (dict, optional): Weights for different loss components.
             norm (int): The norm to use for the loss calculation.
+            reinitialize (bool): Whether to reinitialize the model parameters before training.
         """
         
-        batch_ids = self.training_setup(X, batch_metadata)
+        batch_ids = self.training_setup(X, batch_metadata, reinitialize=reinitialize)
         
         if loss_weights is None:
             loss_weights = {
@@ -117,7 +167,10 @@ class BaseIntegration():
             }
         
         for epoch in range(epochs):
-            self.run_epoch(X, batch_ids, loss_weights=loss_weights, norm=norm, k_inter=k_inter, k_intra=k_intra, **kwargs)
+            self.run_epoch(
+                X, batch_ids, loss_weights=loss_weights, norm=norm,
+                k_inter=k_inter, k_intra=k_intra, **kwargs
+            )
         
         return
     
@@ -138,11 +191,42 @@ class BaseIntegration():
             outputs[effect] = self.models[effect](X, batch_ids[:, self.effects.index(effect)])
         
         return outputs
-    
-    
-    
-    
-    
+
+
+    def transform(self, X, batch_metadata):
+        """
+        Apply the trained model to produce the batch-corrected representation.
+
+        Args:
+            X (array like): Input data of shape (n_samples, n_features).
+            batch_metadata (array like): Batch labels of shape (n_samples,) or (n_samples, n_effects),
+                using the same effect columns and label values seen during training.
+
+        Returns:
+            torch.Tensor: Corrected representation of shape (n_samples, out_channels), the
+                average across per-effect model outputs (same combination rule as loss()).
+        """
+
+        if not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, dtype=torch.float32)
+        assert X.ndim == 2, "X must be a 2D array-like structure."
+
+        batch_metadata = pd.DataFrame(batch_metadata)
+        assert list(batch_metadata.columns) == self.effects, "batch_metadata must contain the same effects used during training."
+
+        batch_ids = pd.DataFrame({
+            effect: batch_metadata[effect].map(self.batch_dict[effect]) for effect in self.effects
+        })
+        assert not batch_ids.isna().any().any(), "batch_metadata contains label(s) not seen during training."
+        batch_ids = torch.tensor(batch_ids.values, dtype=torch.int32)
+
+        self.set_mode('eval')
+        with torch.no_grad():
+            outputs = self.forward(X, batch_ids)
+
+        return torch.stack(list(outputs.values()), dim=0).mean(dim=0)
+
+
     def loss(self, X, batch_ids, norm: int = 2):
         """
         Compute the multi-effect loss.
@@ -189,7 +273,8 @@ class BaseIntegration():
             "knn_loss": torch.stack(knn_losses).mean(),
         }
 
-    def run_epoch(self, X, batch_ids, loss_weights: dict, norm: int = 2, k_inter: int = 5, k_intra: int = None, **kwargs):
+    def run_epoch(self, X, batch_ids, loss_weights: dict, norm: int = 2,
+                  k_inter: int = 5, k_intra: int = None, **kwargs):
         """
         Run a single training epoch.
 
@@ -202,6 +287,8 @@ class BaseIntegration():
             k_intra (int, optional): Number of intra-batch neighbors to use (for topology loss).
             **kwargs: Additional keyword arguments for training.
         """
+        
+        self.set_mode('train')
 
         # X and batch_ids are constant across epochs for full-batch training, so the raw
         # similarity matrix and the per-effect adjacency graphs only need computing once,
@@ -221,8 +308,11 @@ class BaseIntegration():
 
         loss_dict = self.loss(X, batch_ids, norm=norm)
         total_loss = sum(loss_dict[loss_name] * weight for loss_name, weight in loss_weights.items())
+        total_loss /= sum(loss_weights.values()) # normalize by the sum of weights so that the absolute scale of the weights doesn't matter
 
         total_loss.backward()
         self.optimizer.step()
 
         return total_loss.item()
+    
+    
