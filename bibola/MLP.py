@@ -34,7 +34,7 @@ class BatchMLP(torch.nn.Module):
 
 class DecoderMLP(torch.nn.Module):
 
-    def __init__(self, in_channels: int, hidden_channels: list, out_channels: int, **kwargs):
+    def __init__(self, in_channels: int, hidden_channels: list, out_channels: int, batch_ohe_dim: int = 0, **kwargs):
         """
         Initialize the DecoderMLP, mapping a batch-corrected representation back to the
         original feature space so a reconstruction loss can be computed against it.
@@ -43,19 +43,23 @@ class DecoderMLP(torch.nn.Module):
             in_channels (int): Number of input channels (the integration model's out_channels).
             hidden_channels (list): List of hidden channel sizes.
             out_channels (int): Number of output channels (the original input's in_channels).
+            batch_ohe_dim (int): Width of the concatenated batch one-hot vector (sum of
+                n_batches across all effects) that is appended to the input at the first
+                layer, so the decoder knows which batch a sample came from when reconstructing it.
         """
         super(DecoderMLP, self).__init__()
+        self.batch_ohe_dim = batch_ohe_dim
         self.sequential = torch.nn.Sequential(
             MLP(
-                in_channels=in_channels,
+                in_channels=in_channels + batch_ohe_dim,
                 hidden_channels=hidden_channels,
                 **kwargs
             ),
             torch.nn.Linear(hidden_channels[-1], out_channels),
         )
 
-    def forward(self, x):
-        return self.sequential(x)
+    def forward(self, x, batch_ohe):
+        return self.sequential(torch.cat([x, batch_ohe], dim=1))
 
 
 class MultiBatchesMLP(torch.nn.Module):

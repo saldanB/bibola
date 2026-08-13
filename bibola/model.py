@@ -112,6 +112,7 @@ class BaseIntegration():
                 self.batch_dict[effect] = {key: i for i, key in enumerate(unique_keys)}
                 batch_ids[effect] = batch_metadata[effect].map(self.batch_dict[effect])
         batch_ids = torch.tensor(batch_ids.values, dtype=torch.int32)
+        self.batch_ohe_dim = sum(len(self.batch_dict[effect]) for effect in self.effects)
 
         if reinitialize or not hasattr(self, "models"):
             # create a MultiBatchesMLP model for each effect
@@ -127,11 +128,14 @@ class BaseIntegration():
             }
 
             # decoder maps the corrected representation (out_channels) back to the
-            # original feature space (in_channels), for the reconstruction loss term
+            # original feature space (in_channels), for the reconstruction loss term.
+            # It's also given the sample's batch one-hot (concatenated across effects),
+            # so reconstruction is conditioned on which batch the sample came from.
             self.decoder = DecoderMLP(
                 in_channels=self.out_channels,
                 hidden_channels=self.hidden_channels[::-1],
                 out_channels=self.in_channels,
+                batch_ohe_dim=self.batch_ohe_dim,
                 **self.model_kwargs
             )
 
@@ -249,6 +253,30 @@ class BaseIntegration():
         return torch.stack(list(outputs.values()), dim=0).mean(dim=0)
 
 
+    def _batch_ohe(self, batch_ids):
+        """
+        Build the concatenated batch one-hot encoding for the decoder.
+
+        Each effect's batch id column is one-hot encoded independently (width =
+        that effect's number of unique batches) and the results are concatenated
+        along the feature dimension, in `self.effects` order. E.g. for a sample in
+        run 3 (of 3) and donor 2 (of 6): ohe = [0,0,1] ++ [0,1,0,0,0,0].
+
+        Args:
+            batch_ids (torch.Tensor): Batch IDs of shape (n_samples, n_effects).
+
+        Returns:
+            torch.Tensor: One-hot batch encoding of shape (n_samples, batch_ohe_dim).
+        """
+        ohe_parts = [
+            torch.nn.functional.one_hot(
+                batch_ids[:, self.effects.index(effect)].long(),
+                num_classes=len(self.batch_dict[effect])
+            ).float()
+            for effect in self.effects
+        ]
+        return torch.cat(ohe_parts, dim=1)
+
     def loss(self, X, batch_ids, norm: int = 2):
         """
         Compute the multi-effect loss.
@@ -273,7 +301,8 @@ class BaseIntegration():
         x_transformed = torch.stack(list(outputs.values()), dim=0).mean(dim=0)
         w_transformed = similarity_matrix(x_transformed, norm=norm)
 
-        x_reconstructed = self.decoder(x_transformed)
+        batch_ohe = self._batch_ohe(batch_ids)
+        x_reconstructed = self.decoder(x_transformed, batch_ohe)
         # relative (scale-free) reconstruction error, so its magnitude stays comparable
         # to the other, O(1) similarity-based loss terms regardless of X's raw scale
         reconstruction_loss = (torch.norm(X - x_reconstructed, p=norm, dim=1)
