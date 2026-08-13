@@ -32,6 +32,32 @@ class BatchMLP(torch.nn.Module):
         
 
 
+class DecoderMLP(torch.nn.Module):
+
+    def __init__(self, in_channels: int, hidden_channels: list, out_channels: int, **kwargs):
+        """
+        Initialize the DecoderMLP, mapping a batch-corrected representation back to the
+        original feature space so a reconstruction loss can be computed against it.
+
+        Args:
+            in_channels (int): Number of input channels (the integration model's out_channels).
+            hidden_channels (list): List of hidden channel sizes.
+            out_channels (int): Number of output channels (the original input's in_channels).
+        """
+        super(DecoderMLP, self).__init__()
+        self.sequential = torch.nn.Sequential(
+            MLP(
+                in_channels=in_channels,
+                hidden_channels=hidden_channels,
+                **kwargs
+            ),
+            torch.nn.Linear(hidden_channels[-1], out_channels),
+        )
+
+    def forward(self, x):
+        return self.sequential(x)
+
+
 class MultiBatchesMLP(torch.nn.Module):
     def __init__(self, in_channels: int, hidden_channels: list, out_channels: int, n_batches: int, **kwargs):
         """
@@ -91,57 +117,6 @@ class MultiBatchesMLP(torch.nn.Module):
             outputs = outputs.scatter(0, all_indices.unsqueeze(1).expand_as(all_outputs), all_outputs)
         return outputs
         
-    
-    def loss(self, x, w, a_inter, batch, a_intra=None, norm=2):
-        
-        x_transformed = self.forward(x, batch)
-        w_transformed = similarity_matrix(x_transformed, norm=norm)
-        
-        # Compute the Local Indicators of Batch Spatial Association (LIBSA) for each sample in a batch
-        # we want to minimize the absolute values of the LISA values, as we don't want negative autocorrelation.
-        abs_lisa_values = torch.abs(LIBSA(w_transformed, batch, norm=norm)) # (n_samples, n_batches))
-        
-        # Compute the batch similarity preservation scores
-        # it quantifies how well the similarity structure of each batch is preserved after transformation.
-        topology_preservation_scores = batch_similarity_preservation(w, w_transformed, batch, a_intra) # (n_batches,)
-        
-        knn_similarity = w_transformed[a_inter>0]
-        
-        return {
-            "abs_lisa_loss": abs_lisa_values.mean(),
-            "topology_loss": (-topology_preservation_scores).mean(),
-            "knn_loss": (-knn_similarity).mean()
-        }
-
-    def fit(self, x, batch, epochs, norm=2, lr=1e-3, print_every=10, k_inter=5, k_intra=None, loss_weights=None):
-        self.train()
-        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-        
-        # original intra-batch topology we wanna preserve after transformation
-        w = similarity_matrix(x, norm=norm)
-        
-        # adjacency matrix of the inter-batch graph, where edges connect samples from different batches based on their similarity.
-        a_inter = inter_batch_graph(x, batch, k=k_inter)
-        
-        # adjacency matrix of the intra-batch graph, where edges connect samples from the same batch based on their similarity.
-        a_intra = intra_batch_graph(x, batch, k=k_intra) if k_intra is not None else None
-        
-        if loss_weights is None:
-            loss_weights = {
-                "abs_lisa_loss": 1.0,
-                "topology_loss": 1.0,
-                "knn_loss": 1.0
-            }
-        
-        with torch.autograd.set_detect_anomaly(True):
-            for epoch in range(epochs):
-                optimizer.zero_grad()
-                loss_dict = self.loss(x, w, a_inter, batch, a_intra=a_intra, norm=norm)
-                loss = sum(loss_dict[loss_name] * weight for loss_name, weight in loss_weights.items())
-                loss.backward()
-                optimizer.step()
-                if epoch % print_every == 0:
-                    print(f"Epoch {epoch}, Loss: {loss.item()}")
 
 
 

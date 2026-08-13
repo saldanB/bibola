@@ -1,6 +1,6 @@
 import torch
 import pandas as pd
-from bibola.MLP import MultiBatchesMLP
+from bibola.MLP import MultiBatchesMLP, DecoderMLP
 from bibola.spatial_autocorrelation import similarity_matrix, LIBSA
 from bibola.knn import inter_batch_graph, intra_batch_graph
 from bibola.topology import batch_similarity_preservation
@@ -48,7 +48,7 @@ class BaseIntegration():
             lines.append(f"  model_kwargs:    {self.model_kwargs}")
 
         if hasattr(self, "effects"):
-            n_params = sum(p.numel() for model in self.models.values() for p in model.parameters())
+            n_params = sum(p.numel() for model in list(self.models.values()) + [self.decoder] for p in model.parameters())
             lines.append(f"  status:          fitted ({n_params:,} parameters)")
             lines.append("  effects:")
             for effect in self.effects:
@@ -66,7 +66,7 @@ class BaseIntegration():
         Args:
             mode (str): Mode to set ('train' or 'eval').
         """
-        for model in self.models.values():
+        for model in list(self.models.values()) + [self.decoder]:
             if mode == 'train':
                 model.train()
             elif mode == 'eval':
@@ -126,9 +126,18 @@ class BaseIntegration():
                 for effect in self.effects
             }
 
+            # decoder maps the corrected representation (out_channels) back to the
+            # original feature space (in_channels), for the reconstruction loss term
+            self.decoder = DecoderMLP(
+                in_channels=self.out_channels,
+                hidden_channels=self.hidden_channels[::-1],
+                out_channels=self.in_channels,
+                **self.model_kwargs
+            )
+
             # initialize the optimizer in order to manage parameters from all models
             self.optimizer = self.optimizer_type(
-                [param for model in self.models.values() for param in model.parameters()],
+                [param for model in list(self.models.values()) + [self.decoder] for param in model.parameters()],
                 **self.optimizer_kwargs
             )
             
@@ -172,7 +181,8 @@ class BaseIntegration():
             loss_weights = {
                 "abs_lisa_loss": 1.0,
                 "topology_loss": 1.0,
-                "knn_loss": 1.0
+                "knn_loss": 1.0,
+                "reconstruction_loss": 1.0
             }
 
         for epoch in range(epochs):
@@ -263,6 +273,12 @@ class BaseIntegration():
         x_transformed = torch.stack(list(outputs.values()), dim=0).mean(dim=0)
         w_transformed = similarity_matrix(x_transformed, norm=norm)
 
+        x_reconstructed = self.decoder(x_transformed)
+        # relative (scale-free) reconstruction error, so its magnitude stays comparable
+        # to the other, O(1) similarity-based loss terms regardless of X's raw scale
+        reconstruction_loss = (torch.norm(X - x_reconstructed, p=norm, dim=1)
+                                / (torch.norm(X, p=norm, dim=1) + 1e-8)).mean()
+
         abs_lisa_losses = []
         topology_losses = []
         knn_losses = []
@@ -283,6 +299,7 @@ class BaseIntegration():
             "abs_lisa_loss": torch.stack(abs_lisa_losses).mean(),
             "topology_loss": torch.stack(topology_losses).mean(),
             "knn_loss": torch.stack(knn_losses).mean(),
+            "reconstruction_loss": reconstruction_loss,
         }
 
     def run_epoch(self, X, batch_ids, loss_weights: dict, norm: int = 2,
