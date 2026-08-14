@@ -49,6 +49,7 @@ class DecoderMLP(torch.nn.Module):
         """
         super(DecoderMLP, self).__init__()
         self.batch_ohe_dim = batch_ohe_dim
+        self.batchnorm = torch.nn.BatchNorm1d(in_channels, affine=False)
         self.sequential = torch.nn.Sequential(
             MLP(
                 in_channels=in_channels + batch_ohe_dim,
@@ -59,6 +60,7 @@ class DecoderMLP(torch.nn.Module):
         )
 
     def forward(self, x, batch_ohe):
+        x = self.batchnorm(x) # normalize just the input x, not the batch encoding.
         return self.sequential(torch.cat([x, batch_ohe], dim=1))
 
 
