@@ -7,7 +7,19 @@ from bibola.topology import batch_similarity_preservation
 
 
 class BaseIntegration():
-    
+
+    # (optimal, worst) bounds for each raw loss term, used to normalize them onto a
+    # common [0, 1]-worse scale for adaptive_loss_weights. reconstruction_loss is
+    # unbounded above in principle, but empirically starts near 1.0 (an untrained
+    # decoder's relative error) and decreases from there, so 1.0 is used as its
+    # practical "worst" reference rather than a hard ceiling.
+    _LOSS_RANGES = {
+        "abs_lisa_loss": (0.0, 1.0),
+        "topology_loss": (-1.0, 0.0),
+        "knn_loss": (-1.0, 0.0),
+        "reconstruction_loss": (0.0, 1.0),
+    }
+
     def __init__(self, in_channels: int, hidden_channels: list, out_channels: int,
                  optimizer_type: torch.optim.Optimizer = None, optimizer_kwargs: dict = None,
                  **kwargs):
@@ -160,9 +172,50 @@ class BaseIntegration():
     def _format_loss(loss_dict) -> str:
         return ", ".join(f"{loss_name}={loss_value:.4f}" for loss_name, loss_value in loss_dict.items())
 
+    @classmethod
+    def _normalize_loss(cls, loss_name, value):
+        """Map a raw loss value onto its own [0 (optimal), 1 (worst)] scale."""
+        optimal, worst = cls._LOSS_RANGES[loss_name]
+        return (value - optimal) / (worst - optimal)
+
+    def _adapt_loss_weights(self, loss_weights: dict, adaptation_rate: float) -> dict:
+        """
+        Rebalance loss_weights based on how each loss moved (on its own normalized
+        scale) between the previous and current entries in self._loss_cache: a loss
+        that got worse has its weight boosted, one that improved has it reduced,
+        proportional to adaptation_rate. The total weight budget is rescaled back to
+        its previous sum afterwards, so the overall loss scale doesn't drift over
+        many epochs -- only the balance between terms shifts.
+
+        Args:
+            loss_weights (dict): Current weights, one entry per loss name.
+            adaptation_rate (float): Sensitivity of the adjustment to epoch-over-epoch
+                normalized loss movement.
+
+        Returns:
+            dict: A new loss_weights dict (the input is never mutated).
+        """
+        if len(self._loss_cache) < 2:
+            return loss_weights  # no previous epoch yet to compare against
+
+        prev_loss = self._loss_cache[-2]["loss"]
+        curr_loss = self._loss_cache[-1]["loss"]
+
+        total_weight = sum(loss_weights.values())
+        adjusted = {}
+        for loss_name, weight in loss_weights.items():
+            delta = (self._normalize_loss(loss_name, prev_loss[loss_name])
+                     - self._normalize_loss(loss_name, curr_loss[loss_name]))  # >0 improved, <0 worsened
+            factor = min(max(1 - adaptation_rate * delta, 0.1), 10.0)  # clip for stability
+            adjusted[loss_name] = weight * factor
+
+        scale = total_weight / sum(adjusted.values())
+        return {loss_name: weight * scale for loss_name, weight in adjusted.items()}
+
     def fit(self, X, batch_metadata, epochs: int, k_inter: int = 5, k_intra: int = None,
             loss_weights: dict = None, norm: int = 2, reinitialize: bool = False,
-            print_every: int = None, **kwargs):
+            print_every: int = None, adaptive_loss_weights: bool = False,
+            adaptation_rate: float = 0.5, **kwargs):
         """
         Fit the BaseIntegration model.
 
@@ -177,6 +230,13 @@ class BaseIntegration():
             reinitialize (bool): Whether to reinitialize the model parameters before training.
             print_every (int, optional): Print the epoch loss every print_every epochs.
                 None (default) disables printing.
+            adaptive_loss_weights (bool): If True, after each epoch, loss_weights is
+                rebalanced based on each loss's movement (on its own normalized scale,
+                see _LOSS_RANGES) since the previous epoch: terms that got worse are
+                boosted, terms that improved are reduced. Disabled by default -- the
+                weights passed in (or the defaults) are used unchanged throughout.
+            adaptation_rate (float): Only used when adaptive_loss_weights=True. Controls
+                how aggressively loss_weights react to epoch-over-epoch loss movement.
         """
 
         X, batch_ids = self.training_setup(X, batch_metadata, reinitialize=reinitialize)
@@ -194,6 +254,8 @@ class BaseIntegration():
                 X, batch_ids, loss_weights=loss_weights, norm=norm,
                 k_inter=k_inter, k_intra=k_intra, **kwargs
             )
+            if adaptive_loss_weights:
+                loss_weights = self._adapt_loss_weights(loss_weights, adaptation_rate)
             if print_every is not None and (epoch % print_every == 0 or epoch == epochs - 1):
                 components = self._format_loss(self._loss_cache[-1]["loss"])
                 print(f"Epoch {epoch + 1}/{epochs} - total_loss={total_loss:.4f} ({components})")
