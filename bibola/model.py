@@ -253,6 +253,74 @@ class BaseIntegration():
         return torch.stack(list(outputs.values()), dim=0).mean(dim=0)
 
 
+    def reconstruct(self, X, batch_metadata, target_batch=None):
+        """
+        Encode X with its own batch, then decode it as if it belonged to a target batch.
+
+        Useful both to inspect plain reconstruction quality (target_batch=None decodes
+        every cell with its own original batch) and to simulate counterfactuals: how a
+        cell would look had it come from a different batch/run/donor. Encoding always
+        uses the batch given in batch_metadata; only the decoding batch changes.
+
+        Args:
+            X (array like): Input data of shape (n_samples, n_features).
+            batch_metadata (array like): Batch labels of shape (n_samples,) or
+                (n_samples, n_effects), using the same effect columns and label values
+                seen during training. Always used for the encoding step.
+            target_batch (optional): Batch to use for the decoding step.
+                - None (default): decode with each cell's own original batch, i.e. plain
+                  reconstruction.
+                - a DataFrame of the same shape as batch_metadata: per-cell target batch,
+                  one row per sample, same effect columns.
+                - a list/tuple of one label per effect, in `self.effects` order: every
+                  cell is decoded as if it belonged to this single target batch. E.g. for
+                  effects ["run", "donor"], target_batch=["run_3", "donor_2"] reconstructs
+                  every cell as if it came from run 3, donor 2.
+
+        Returns:
+            torch.Tensor: Reconstructed data in the original feature space, shape
+                (n_samples, in_channels).
+        """
+        if not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, dtype=torch.float32)
+        assert X.ndim == 2, "X must be a 2D array-like structure."
+
+        batch_metadata = pd.DataFrame(batch_metadata)
+        assert list(batch_metadata.columns) == self.effects, "batch_metadata must contain the same effects used during training."
+
+        def _to_batch_ids(metadata):
+            batch_ids = pd.DataFrame({
+                effect: metadata[effect].map(self.batch_dict[effect]) for effect in self.effects
+            })
+            assert not batch_ids.isna().any().any(), "batch metadata contains label(s) not seen during training."
+            return torch.tensor(batch_ids.values, dtype=torch.int32)
+
+        batch_ids = _to_batch_ids(batch_metadata)
+
+        if target_batch is None:
+            target_batch_ids = batch_ids
+        elif isinstance(target_batch, (list, tuple)):
+            assert len(target_batch) == len(self.effects), "target_batch list must have one label per effect, in self.effects order."
+            target_metadata = pd.DataFrame({
+                effect: [label] * len(batch_metadata) for effect, label in zip(self.effects, target_batch)
+            })
+            target_batch_ids = _to_batch_ids(target_metadata)
+        else:
+            target_metadata = pd.DataFrame(target_batch)
+            assert target_metadata.shape == batch_metadata.shape, "target_batch DataFrame must have the same shape as batch_metadata."
+            assert list(target_metadata.columns) == self.effects, "target_batch DataFrame must contain the same effects as batch_metadata."
+            target_batch_ids = _to_batch_ids(target_metadata)
+
+        self.set_mode('eval')
+        with torch.no_grad():
+            outputs = self.forward(X, batch_ids)  # encode with the original batch
+            x_transformed = torch.stack(list(outputs.values()), dim=0).mean(dim=0)
+            target_batch_ohe = self._batch_ohe(target_batch_ids)  # decode with the target batch
+            x_reconstructed = self.decoder(x_transformed, target_batch_ohe)
+
+        return x_reconstructed
+
+
     def _batch_ohe(self, batch_ids):
         """
         Build the concatenated batch one-hot encoding for the decoder.
